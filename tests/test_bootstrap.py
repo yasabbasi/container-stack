@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 REPO_ID, OWNER_ID, NUMBER = "111", "222", "333"
 PLAN = "terraform-plan@demo.iam.gserviceaccount.com"
@@ -17,6 +19,7 @@ PLAN_MEMBER = (
 APPLY_MEMBER = (
     f"{PRINCIPALS}/workloadIdentityPools/github-production/attribute.environment/production"
 )
+ISSUER = "https://token.actions.githubusercontent.com"
 FROM_REPO = f'assertion.repository_id=="{REPO_ID}" && assertion.repository_owner_id=="{OWNER_ID}"'
 MAPPING = (
     "google.subject=assertion.sub,attribute.workflow_ref=assertion.workflow_ref,"
@@ -24,86 +27,142 @@ MAPPING = (
 )
 PRODUCTION_MAPPING = "google.subject=assertion.sub,attribute.environment=assertion.environment"
 PRODUCTION_CONDITION = (
-    f'{FROM_REPO} && assertion.environment=="production" && assertion.ref=="refs/heads/main"'
+    f'{FROM_REPO} && assertion.repository_visibility=="public"'
+    ' && assertion.environment=="production" && assertion.ref=="refs/heads/main"'
 )
+POOL_FLAGS = ["--project", "demo", "--location", "global"]
 
 STUB = """
 import json, os, sys
 
 tool, args = os.path.basename(sys.argv[0]), sys.argv[1:]
 config = json.load(open(os.environ["STUB_CONFIG"]))
+state_path = os.environ["STUB_STATE"]
+state = json.load(open(state_path)) if os.path.exists(state_path) else {}
 stdin = sys.stdin.read() if "--input" in args else None
 with open(os.environ["STUB_LOG"], "a") as log:
     log.write(json.dumps([tool, *args, stdin] if stdin else [tool, *args]) + "\\n")
 line = " ".join(args)
-exists = config["exists"]
-if tool == "gh":
+
+
+def save():
+    json.dump(state, open(state_path, "w"))
+
+
+def flag(name):
+    return args[args.index(name) + 1]
+
+
+def key():
+    if "--workload-identity-pool" in args:
+        return "provider/" + flag("--workload-identity-pool")
+    if "workload-identity-pools" in args:
+        return "pool/" + args[3]
+    if "service-accounts" in args:
+        return "account/" + args[3].split("@")[0]
+    return "/".join(args[:2])
+
+
+if any(word in line for word in config["fail"]):
+    sys.exit(1)
+for word, times in config["flaky"].items():
+    if word in line and state.get("flaky/" + word, 0) < times:
+        state["flaky/" + word] = state.get("flaky/" + word, 0) + 1
+        save()
+        sys.exit(1)
+out = []
+if tool == "sleep":
+    pass
+elif tool == "gh":
     if args[:2] == ["repo", "view"]:
-        print("owner/repo")
+        out = ["owner/repo"]
     elif line.startswith("api repos/owner/repo --jq"):
-        print(f"111 222 {config['visibility']}")
+        out = [f"111 222 {config['visibility']}"]
     elif line.startswith("api user"):
-        print("222")
-    elif line.startswith("api repos/owner/repo/environments/production --jq"):
-        print("\\n".join(config["rules"]))
-    elif line.startswith("api repos/owner/repo/environments/production/deployment"):
-        print("main" if exists else "")
+        out = [config["user"]]
+    elif line.startswith("api -X POST"):
+        state["branches"] = state.get("branches", []) + ["main"]
+    elif line.startswith("api repos/owner/repo/environments/production/"):
+        out = state.get("branches", config["branches"])
+    elif line.startswith("api repos/owner/repo/environments/production"):
+        out = [config["gate"]]
 elif args[:2] == ["projects", "describe"]:
-    print("333")
+    out = ["333"]
 elif args[:2] == ["config", "get-value"]:
-    print("owner-account")
-elif "describe" in args and "billing" not in args:
-    sys.exit(0 if exists else 1)
-elif "get-iam-policy" in args:
-    print("\\n".join(config["members"].get(args[3], [])))
+    out = [config["account"]]
 elif args[:3] == ["billing", "projects", "describe"]:
-    print("billingAccounts/stub-billing")
+    out = [config["billing"]]
 elif args[:3] == ["billing", "budgets", "list"]:
-    print("billingAccounts/stub-billing/budgets/1" if exists else "")
+    out = state.get("budget", [])
+elif args[:3] == ["billing", "budgets", "create"]:
+    state["budget"] = ["billingAccounts/stub-billing/budgets/1"]
+elif "keys" in args:
+    out = config["keys"].get(flag("--iam-account"), [])
+elif "get-iam-policy" in args:
+    members = state.get("member/" + args[3], []) + config["members"].get(args[3], [])
+    out = ["roles/iam.workloadIdentityUser\\t" + member for member in members]
+elif args[:2] == ["iam", "service-accounts"] and "add-iam-policy-binding" in args:
+    members = state.setdefault("member/" + args[3], [])
+    if flag("--member") not in members:
+        members.append(flag("--member"))
+elif "providers" in args and "list" in args:
+    out = (["github"] if key() in state else []) + config["providers"]
+elif "describe" in args:
+    sys.exit(0 if key() in state else 1)
+elif "create" in args or "create-oidc" in args:
+    state[key()] = True
+save()
+if out:
+    print("\\n".join(out))
 """
 
 
 def run(
     tmp_path: Path,
     project: str | None = "demo",
-    exists: bool = False,
-    visibility: str = "public",
-    rules: tuple[str, ...] = ("required_reviewers", "branch_policy"),
-    members: dict[str, list[str]] | None = None,
     dotenv: str | None = None,
+    env_extra: dict[str, str] | None = None,
+    **overrides: Any,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
-    """Run a copy of the script, away from the repo's .env, with stub gcloud and gh."""
+    """Run a copy of the script, away from the repo's .env, with stub gcloud, gh and sleep."""
     repo, bin_dir = tmp_path / "repo", tmp_path / "bin"
-    (repo / "scripts").mkdir(parents=True)
-    bin_dir.mkdir()
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    bin_dir.mkdir(exist_ok=True)
     shutil.copy(ROOT / "scripts" / "bootstrap.sh", repo / "scripts")
     (repo / "Makefile").write_text("")
     if dotenv is not None:
         (repo / ".env").write_text(dotenv)
-    for tool in ("gcloud", "gh"):
+    for tool in ("gcloud", "gh", "sleep"):
         (bin_dir / tool).write_text(f"#!{sys.executable}\n{STUB}")
         (bin_dir / tool).chmod(0o755)
-    if members is None:
-        members = {PLAN: [PLAN_MEMBER], APPLY: [APPLY_MEMBER]} if exists else {}
     config: dict[str, Any] = {
-        "exists": exists,
-        "visibility": visibility,
-        "rules": list(rules),
-        "members": members,
-    }
+        "visibility": "public",
+        "user": OWNER_ID,
+        "gate": f"false {OWNER_ID}",
+        "branches": [],
+        "account": "owner-account",
+        "billing": "billingAccounts/stub-billing",
+        "keys": {},
+        "members": {},
+        "providers": [],
+        "fail": [],
+        "flaky": {},
+    } | overrides
     (tmp_path / "config.json").write_text(json.dumps(config))
     log = tmp_path / "log"
-    log.touch()
+    log.write_text("")
     env = {
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "STUB_CONFIG": str(tmp_path / "config.json"),
+        "STUB_STATE": str(tmp_path / "state.json"),
         "STUB_LOG": str(log),
-    }
+    } | (env_extra or {})
     if project is not None:
         env["GCP_PROJECT"] = project
     result = subprocess.run(
-        ["sh", str(repo / "scripts" / "bootstrap.sh")],
+        ["sh", "scripts/bootstrap.sh"],
+        cwd=repo,
         env=env,
         capture_output=True,
         text=True,
@@ -121,15 +180,18 @@ def flag(call: list[str], name: str) -> str:
     return call[call.index(name) + 1]
 
 
+def bindings(calls: list[list[str]]) -> list[list[str]]:
+    return find(calls, "add-iam-policy-binding")
+
+
 def test_first_run_sets_the_gate_before_any_identity(tmp_path: Path) -> None:
     result, calls = run(tmp_path)
     assert result.returncode == 0, result.stderr
     first_iam = next(i for i, c in enumerate(calls) if c[:2] == ["gcloud", "iam"])
     environment = [i for i, c in enumerate(calls) if any("environments/" in a for a in c)]
-    assert len(environment) == 4
+    assert len(environment) == 5
     assert max(environment) < first_iam
-    put = find(calls, "PUT")[0]
-    body = json.loads(put[-1])
+    body = json.loads(find(calls, "PUT")[0][-1])
     assert body["reviewers"] == [{"type": "User", "id": int(OWNER_ID)}]
     assert body["can_admins_bypass"] is False
     assert find(calls, "POST")[0][-4:] == ["-f", "name=main", "-f", "type=branch"]
@@ -139,30 +201,48 @@ def test_first_run_creates_two_pools_and_their_providers(tmp_path: Path) -> None
     _, calls = run(tmp_path)
     pools = find(calls, "workload-identity-pools", "create")
     assert [c[4] for c in pools] == ["github", "github-production"]
-    providers = find(calls, "create-oidc")
-    assert [(c[5], flag(c, "--workload-identity-pool")) for c in providers] == [
-        ("github", "github"),
-        ("github", "github-production"),
+    providers = [c[1:] for c in find(calls, "create-oidc")]
+    assert providers == [
+        ["iam", "workload-identity-pools", "providers", "create-oidc", "github"]
+        + ["--workload-identity-pool", pool, "--issuer-uri", ISSUER]
+        + ["--attribute-mapping", mapping, "--attribute-condition", condition]
+        + POOL_FLAGS
+        for pool, mapping, condition in [
+            ("github", MAPPING, FROM_REPO),
+            ("github-production", PRODUCTION_MAPPING, PRODUCTION_CONDITION),
+        ]
     ]
-    assert flag(providers[0], "--attribute-mapping") == MAPPING
-    assert flag(providers[0], "--attribute-condition") == FROM_REPO
-    assert flag(providers[1], "--attribute-mapping") == PRODUCTION_MAPPING
-    assert flag(providers[1], "--attribute-condition") == PRODUCTION_CONDITION
-    for call in providers:
-        assert flag(call, "--issuer-uri") == "https://token.actions.githubusercontent.com"
 
 
-def test_first_run_binds_each_identity_to_one_principal(tmp_path: Path) -> None:
+def test_display_names_fit_the_limit(tmp_path: Path) -> None:
     _, calls = run(tmp_path)
-    bindings = find(calls, "add-iam-policy-binding", "roles/iam.workloadIdentityUser")
-    assert [(c[4], flag(c, "--member")) for c in bindings] == [
-        (PLAN, PLAN_MEMBER),
-        (APPLY, APPLY_MEMBER),
+    names = [flag(c, "--display-name") for c in calls if "--display-name" in c]
+    assert len(names) == 5
+    assert all(len(name) <= 32 for name in names), names
+
+
+def test_first_run_binds_each_identity_exactly(tmp_path: Path) -> None:
+    _, calls = run(tmp_path)
+    accounts = find(calls, "service-accounts", "add-iam-policy-binding")
+    assert [(c[4], flag(c, "--member"), flag(c, "--role")) for c in accounts] == [
+        (PLAN, PLAN_MEMBER, "roles/iam.workloadIdentityUser"),
+        (APPLY, APPLY_MEMBER, "roles/iam.workloadIdentityUser"),
+    ]
+    project = find(calls, "projects", "add-iam-policy-binding")
+    assert [(flag(c, "--member"), flag(c, "--role")) for c in project] == [
+        (f"serviceAccount:{PLAN}", "roles/browser"),
+        (f"serviceAccount:{PLAN}", "roles/iam.serviceAccountViewer"),
+        (f"serviceAccount:{PLAN}", "roles/cloudquotas.viewer"),
+        (f"serviceAccount:{PLAN}", "roles/serviceusage.serviceUsageViewer"),
+        (f"serviceAccount:{APPLY}", "roles/resourcemanager.projectIamAdmin"),
+        (f"serviceAccount:{APPLY}", "roles/iam.serviceAccountAdmin"),
+        (f"serviceAccount:{APPLY}", "roles/serviceusage.serviceUsageAdmin"),
+        (f"serviceAccount:{APPLY}", "roles/cloudquotas.admin"),
     ]
     bucket = find(calls, "buckets", "add-iam-policy-binding")
-    assert [flag(c, "--role") for c in bucket] == [
-        "roles/storage.objectViewer",
-        "roles/storage.objectAdmin",
+    assert [(c[4], flag(c, "--member"), flag(c, "--role")) for c in bucket] == [
+        ("gs://demo-terraform-state", f"serviceAccount:{PLAN}", "roles/storage.objectViewer"),
+        ("gs://demo-terraform-state", f"serviceAccount:{APPLY}", "roles/storage.objectAdmin"),
     ]
 
 
@@ -180,31 +260,51 @@ def test_first_run_sets_the_secrets(tmp_path: Path) -> None:
     }
 
 
-def test_budget_is_last_and_hides_the_billing_account(tmp_path: Path) -> None:
+def test_budget_is_last_and_hides_the_ids(tmp_path: Path) -> None:
     result, calls = run(tmp_path)
     assert calls[-1][:4] == ["gcloud", "billing", "budgets", "create"]
     assert flag(calls[-1], "--budget-amount") == "75"
     for call in find(calls, "budgets"):
         assert flag(call, "--billing-project") == "demo"
     assert "stub-billing" not in result.stdout + result.stderr
+    assert NUMBER not in result.stdout + result.stderr
 
 
 def test_second_run_updates_and_creates_nothing(tmp_path: Path) -> None:
-    result, calls = run(tmp_path, exists=True)
+    run(tmp_path)
+    result, calls = run(tmp_path)
     assert result.returncode == 0, result.stderr
     assert not [c for c in calls if any(a in ("create", "create-oidc", "POST") for a in c)]
-    updates = find(calls, "update-oidc")
-    assert [
-        (
-            flag(c, "--workload-identity-pool"),
-            flag(c, "--attribute-mapping"),
-            flag(c, "--attribute-condition"),
-        )
-        for c in updates
-    ] == [
-        ("github", MAPPING, FROM_REPO),
-        ("github-production", PRODUCTION_MAPPING, PRODUCTION_CONDITION),
+    assert [c[1:] for c in find(calls, "update-oidc")] == [
+        ["iam", "workload-identity-pools", "providers", "update-oidc", "github"]
+        + ["--workload-identity-pool", pool, "--issuer-uri", ISSUER]
+        + ["--attribute-mapping", mapping, "--attribute-condition", condition]
+        + POOL_FLAGS
+        for pool, mapping, condition in [
+            ("github", MAPPING, FROM_REPO),
+            ("github-production", PRODUCTION_MAPPING, PRODUCTION_CONDITION),
+        ]
     ]
+    assert "kept" in result.stdout
+
+
+def test_half_finished_run_finishes_on_the_next(tmp_path: Path) -> None:
+    first, _ = run(tmp_path, fail=["create-oidc"])
+    assert first.returncode != 0
+    result, calls = run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert [c[4] for c in find(calls, "workload-identity-pools", "create")] == ["github-production"]
+    assert [flag(c, "--workload-identity-pool") for c in find(calls, "create-oidc")] == [
+        "github",
+        "github-production",
+    ]
+
+
+def test_retry_outlasts_two_failures(tmp_path: Path) -> None:
+    result, calls = run(tmp_path, flaky={"projects add-iam-policy-binding": 2})
+    assert result.returncode == 0, result.stderr
+    assert len(find(calls, "projects", "add-iam-policy-binding")) == 10
+    assert len([c for c in calls if c[0] == "sleep"]) == 2
 
 
 def test_missing_project_prints_usage(tmp_path: Path) -> None:
@@ -214,29 +314,86 @@ def test_missing_project_prints_usage(tmp_path: Path) -> None:
     assert calls == []
 
 
-def test_project_can_come_from_dotenv(tmp_path: Path) -> None:
-    result, calls = run(tmp_path, project=None, dotenv="GCP_PROJECT=demo\nBUDGET=20\n")
+def test_settings_are_read_from_dotenv_without_running_it(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    dotenv = f"GCP_PROJECT=demo\r\ntouch {marker}\r\nBUDGET=20\r\nOTHER=1\r\n"
+    result, calls = run(tmp_path, project=None, dotenv=dotenv)
     assert result.returncode == 0, result.stderr
     assert flag(calls[-1], "--budget-amount") == "20"
+    assert flag(calls[-1], "--filter-projects") == "projects/demo"
+    assert not marker.exists()
 
 
-def test_private_repo_stops_before_any_change(tmp_path: Path) -> None:
-    result, calls = run(tmp_path, visibility="private")
-    assert result.returncode == 1
-    assert "public" in result.stderr
-    assert [c for c in calls if c[0] == "gcloud" or "-X" in c] == []
+def test_environment_wins_over_dotenv(tmp_path: Path) -> None:
+    result, calls = run(
+        tmp_path, dotenv="GCP_PROJECT=other\nBUDGET=20\n", env_extra={"BUDGET": "9"}
+    )
+    assert result.returncode == 0, result.stderr
+    assert flag(calls[-1], "--budget-amount") == "9"
+    assert flag(calls[-1], "--filter-projects") == "projects/demo"
 
 
-def test_environment_without_reviewer_stops_before_google(tmp_path: Path) -> None:
-    result, calls = run(tmp_path, rules=("branch_policy",))
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"visibility": "private"}, "public"),
+        ({"user": "999"}, "owner"),
+        ({"fail": ["-X PUT"]}, ""),
+    ],
+)
+def test_github_problems_stop_before_google(
+    tmp_path: Path, overrides: dict[str, Any], message: str
+) -> None:
+    result, calls = run(tmp_path, **overrides)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert [c for c in calls if c[0] == "gcloud"] == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"gate": "false "},
+        {"gate": f"false {OWNER_ID},999"},
+        {"gate": f"true {OWNER_ID}"},
+        {"branches": ["main", "dev"]},
+    ],
+)
+def test_weak_environment_stops_before_google(tmp_path: Path, overrides: dict[str, Any]) -> None:
+    result, calls = run(tmp_path, **overrides)
     assert result.returncode == 1
     assert "reviewer" in result.stderr
     assert [c for c in calls if c[:2] == ["gcloud", "iam"]] == []
 
 
-def test_unexpected_member_stops_the_run(tmp_path: Path) -> None:
-    other = "principal://example/other"
-    result, calls = run(tmp_path, exists=True, members={PLAN: [PLAN_MEMBER, other]})
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [({"account": ""}, "account"), ({"billing": ""}, "billing")],
+)
+def test_google_problems_stop_before_changes(
+    tmp_path: Path, overrides: dict[str, Any], message: str
+) -> None:
+    result, calls = run(tmp_path, **overrides)
     assert result.returncode == 1
-    assert other in result.stderr
+    assert message in result.stderr
+    assert [c for c in calls if c[:2] in (["gcloud", "iam"], ["gcloud", "services"])] == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"members": {PLAN: ["principal://example/other"]}},
+        {"members": {APPLY: ["principal://example/other"]}},
+        {"members": {PLAN: [PLAN_MEMBER + "9"]}},
+        {"fail": ["get-iam-policy"]},
+        {"keys": {APPLY: ["key-1"]}},
+        {"providers": ["other"]},
+    ],
+)
+def test_unexpected_access_stops_before_any_binding(
+    tmp_path: Path, overrides: dict[str, Any]
+) -> None:
+    result, calls = run(tmp_path, **overrides)
+    assert result.returncode != 0
+    assert bindings(calls) == []
     assert find(calls, "secret") == []

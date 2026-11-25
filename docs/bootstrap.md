@@ -26,10 +26,13 @@
 ## How to run it
 
 ```sh
-GCP_PROJECT=your-project-id scripts/bootstrap.sh
+GCP_PROJECT=your-project-id sh scripts/bootstrap.sh
 ```
 
 ## Running it again
 
-It is safe to run again. What exists is not created again, the providers are updated to the
-same settings, and the script stops if either identity can be used by anyone it doesn't expect.
+It is safe to run again, and finishes a run that stopped halfway. What exists is not created
+again, and both providers are updated to the same settings. Before it grants anything, it
+stops if the environment's reviewer, admin bypass or branch differ from the above, if a pool
+has a provider other than `github`, or if either identity has a user-managed key or any
+policy member other than its one expected principal.
