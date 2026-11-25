@@ -190,6 +190,18 @@ someone code execution in one of them would reach everything that identity may d
 reading the App key. The App key itself can't push to `main`, approve or change workflows,
 because of the rulesets.
 
+### Settings
+
+| Where | A setting comes from |
+|---|---|
+| Locally | A `.env` file that is never committed. `.env.example` lists its names |
+| GitHub Actions | Repo secrets with the same names, set by the bootstrap script |
+| The VM | A `.env` written at start-up from values Terraform sets |
+
+No setting is a secret. The real secrets live elsewhere: the App key is in the owner's key
+store locally and in Secret Manager in the cloud; model credentials come from the owner's
+Google sign-in locally and from the VM's identity in the cloud.
+
 ### Changing the model later
 
 Everything that knows which model is used, or that the agent is Claude Code, sits in two
@@ -295,6 +307,7 @@ service account keys, SSH.
 | Identity | Used by | Signs in with | May do |
 |---|---|---|---|
 | The owner | The bootstrap script, the console | Their Google login | Everything in the project, and its billing |
+| `reader` | The `check` workflow on `main`, started by hand | Federation from GitHub | Read the project's setup: quotas, enabled services, identities, access rules. Changes nothing. Reads no secret value, bucket contents or data |
 | `terraform-plan` | The `plan` workflow, on pull requests the owner triggers | Federation from GitHub | Read the project's configuration and the state bucket. Changes nothing |
 | `terraform-apply` | The `apply` workflow: `main` only, behind the `production` environment the owner approves | Federation from GitHub | Create, change and destroy the project's resources, including access rules. In effect it owns the project. It has no role on the billing account |
 | `operator` | The `operate` and `pipeline` workflows on `main` | Federation from GitHub | Start, stop and read one VM. Write request files and read result files in one bucket. Nothing else |
@@ -304,6 +317,9 @@ service account keys, SSH.
 
 How the federation is narrowed:
 
+- There are two pools: `github` for every run, and `github-production` for jobs in the
+  `production` environment on `main`. So no other run can carry what `terraform-apply` is
+  bound to.
 - The provider accepts tokens only from this repo and this owner, matched by their numeric
   ids, not their names.
 - Each identity is bound to one combination of claims. `terraform-apply`: the `production`
@@ -315,6 +331,24 @@ How the federation is narrowed:
   repo. The dispatcher refuses before pushing, and `gate` refuses again.
 - The `production` environment allows only `main`, requires the owner's approval and has
   administrator bypass turned off.
+
+### How Claude Code works on the project
+
+| Kind | How | Approval |
+|---|---|---|
+| Look | The `check` workflow as `reader`, and the `plan` workflow as `terraform-plan` | None |
+| Operate | The `operate` workflow's menu as `operator` | None |
+| Change | A pull request, then the `apply` workflow as `terraform-apply` | The owner, on GitHub |
+
+- Claude Code's shell holds no Google credential.
+- Each identity's permissions are lines in `terraform/google/`. They grow only through pull
+  requests the owner approves.
+- `check` takes a choice from a fixed list of read-only commands, never free text, because
+  its log is public.
+
+One gap: Claude Code's `gh` is signed in as the owner, so the approval of an apply does not
+bind that shell as it binds an agent session. A separate GitHub login would close it, and is
+a later decision.
 
 ## 6. Verify in container mode
 
@@ -422,24 +456,26 @@ In order. The first has a possible wait, so it comes before anything else.
    Opus 5.5 card and press Enable. Google documents no waiting time, but new projects have
    been reported to start with no quota, and a quota request can take a day or two. I will
    give you a one-line test to run right after.
-2. Run the runtime trial on the laptop, with the commands I give you (section 3). Install
+2. Run the bootstrap script once, on the laptop. It enables the APIs, creates the state
+   bucket, the federation, the two Terraform identities, the secret, the budget with its
+   alerts, and the `production` environment with you as reviewer. It sets the repo's
+   secrets with `gh` (section 3, "Settings"). It comes before the runtime trial so that the quota request and
+   every later Google-side change is then a pull request you approve.
+3. Run the runtime trial on the laptop, with the commands I give you (section 3). Install
    Docker Desktop only if the trial fails.
-3. On the laptop, run `gcloud auth application-default login` once, for the model-proxy.
-4. On the laptop, start the round 1 watcher again with `make watch`, so the four task-agent
+4. On the laptop, run `gcloud auth application-default login` once, for the model-proxy.
+5. On the laptop, start the round 1 watcher again with `make watch`, so the four task-agent
    tasks can run. This is the "watcher is needed again" moment.
-5. At the end of phase 1, in one sitting: `make init` for `container-stack` (twice, with a
+6. At the end of phase 1, in one sitting: `make init` for `container-stack` (twice, with a
    merge between), stop the round 1 watcher, `make up`, `make verify`.
-6. Make the four image packages public on GitHub. New packages start private.
-7. At the start of phase 2, run the bootstrap script once, on the laptop. It enables the
-   APIs, creates the state bucket, the federation, the two Terraform identities, the secret
-   with the App key read from your key store, the budget with its alerts, and the
-   `production` environment with you as reviewer. It sets the repo's variables with `gh`.
-   This is the last time the laptop is needed.
-8. Create the spend cap on Agent Platform in the console, if the script can't.
-9. Approve each `apply` run on GitHub.
-10. Still open from round 1: delete the old GitHub App.
+7. Make the four image packages public on GitHub. New packages start private.
+8. At the start of phase 2, store the App key in the secret, read from your key store, with
+   the command I give you, on the laptop. This is the last time the laptop is needed.
+9. Create the spend cap on Agent Platform in the console, if the script can't.
+10. Approve each `apply` run on GitHub.
+11. Still open from round 1: delete the old GitHub App.
 
-Everything after step 7 is on GitHub's website: merge, approve a deployment, run a workflow.
+Everything after step 8 is on GitHub's website: merge, approve a deployment, run a workflow.
 
 ### Operator actions from GitHub
 
@@ -533,7 +569,7 @@ Each is tested at the step named, and I stop and show the evidence if it fails.
 | Open point | Tested in |
 |---|---|
 | Google's own `e2-medium` price table would not load. $24.46 comes from two other sources that agree | Phase 2, on the first bill line |
-| Whether a new project gets Claude quota at once, and how long a request takes | Owner step 1 |
+| Claude quota. Settled on 2026-11-24: enabling the model was instant, but the new project's quota is zero, so calls are refused until Google grants a request. Still open: whether and when it does | Owner step 1 |
 | Whether Docker Engine runs inside one of Apple's container machines. If not, Docker Desktop or another engine | Phase 1, first day |
 | Whether my shell may talk to the laptop's container runtime. Today it can't reach Apple's service, so I tested nothing with it. If that stays, the owner runs the commands I hand over or allows the access | Phase 1, first day |
 | Whether Claude Code accepts a plain `http://` proxy address on a private network. If not, the proxy gets a certificate | Phase 1, first day |
@@ -570,15 +606,14 @@ summary of five lines at most.
 
 ### Phase 1: containers on the laptop
 
-1. Owner steps 1 to 4.
+1. Owner steps 1 to 5.
 2. A first day of trials that settles the five phase 1 rows in section 10: the laptop's
    runtime first, then the session image.
 3. The four task-agent tasks through the round 1 watcher. Tag the three repos.
-4. `container-stack`, written by hand in four signed milestones, as the dispatcher's
-   guardrails were in round 1: the skeleton and CI; the images, Compose file and launcher;
-   the two proxies and the ledger; the probes and `make verify`. Two reviewers read the
-   launcher, the proxies and the probes before each is committed.
-5. Owner step 5. Verify's output goes to the owner.
+4. `container-stack`: work is submitted as tasks and dispatched as in the other repos. A
+   person writes only what the loop can't: workflow files, `Makefile`, `pyproject.toml`,
+   `terraform/`, `images/` and `compose.yaml`.
+5. Owner step 6. Verify's output goes to the owner.
 6. The mcp-server task runs through Compose and is reviewed as in round 1.
 
 **Done when** that task has gone from issue to merged pull request through Compose on the
@@ -588,7 +623,7 @@ laptop, and `make verify` passes there.
 
 1. `terraform/google/`, the start-up script and the `plan`, `apply`, `operate` and destroy
    workflows, as human-authored pull requests. Each shows its plan.
-2. Owner steps 6 to 9.
+2. Owner steps 7 to 10.
 3. The VM starts the same Compose file by itself. `operate` runs verify; the output is in
    the run summary.
 4. The owner files a task from the phone with the laptop off. It merges.
