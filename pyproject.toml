@@ -1,0 +1,49 @@
+[project]
+name = "container-stack"
+version = "0.1.0"
+description = "Runs task-agent, data-pipeline and mcp-server from containers, on any machine."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "yas", email = "355981534+yasabbasi@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+# No package yet: the repo holds scripts, docs and tests.
+[tool.uv]
+package = false
+
+# Settings task-agent reads. Agents may not change this file; gate enforces it.
+[tool.task-agent]
+agent_commands = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+strict = true
+files = ["tests"]
+
+[tool.pymarkdown]
+plugins.line-length.enabled = false
+plugins.first-line-heading.enabled = false
+extensions.front-matter.enabled = true
+
+[dependency-groups]
+dev = [
+    "mypy==2.4.1",
+    "pymarkdownlnt==0.9.42",
+    "pytest==9.2.0",
+    "ruff==0.17.5",
+    "shellcheck-py==0.11.0.1",
+    "yamllint==1.38.0",
+]
