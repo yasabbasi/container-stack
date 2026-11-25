@@ -457,17 +457,15 @@ In order. The first has a possible wait, so it comes before anything else.
    been reported to start with no quota, and a quota request can take a day or two. I will
    give you a one-line test to run right after.
 2. Run the bootstrap script once, on the laptop. It enables the APIs, creates the state
-   bucket, the federation, the two Terraform identities, the secret, the budget with its
-   alerts, and the `production` environment with you as reviewer. It sets the repo's
-   secrets with `gh` (section 3, "Settings"). It comes before the runtime trial so that the quota request and
+   bucket, the federation, the two Terraform identities, the budget with its alerts, and the
+   `production` environment with you as reviewer. It sets the repo's secrets with `gh`
+   (section 3, "Settings"). It comes before the runtime trial so that the quota request and
    every later Google-side change is then a pull request you approve.
 3. Run the runtime trial on the laptop, with the commands I give you (section 3). Install
    Docker Desktop only if the trial fails.
 4. On the laptop, run `gcloud auth application-default login` once, for the model-proxy.
-5. On the laptop, start the round 1 watcher again with `make watch`, so the four task-agent
-   tasks can run. This is the "watcher is needed again" moment.
-6. At the end of phase 1, in one sitting: `make init` for `container-stack` (twice, with a
-   merge between), stop the round 1 watcher, `make up`, `make verify`.
+5. Done on 2026-11-25: the round 1 watcher started again; `make init` ran for `container-stack`.
+6. At the end of phase 1, in one sitting: stop the round 1 watcher, `make up`, `make verify`.
 7. Make the four image packages public on GitHub. New packages start private.
 8. At the start of phase 2, store the App key in the secret, read from your key store, with
    the command I give you, on the laptop. This is the last time the laptop is needed.

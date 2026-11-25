@@ -39,6 +39,22 @@ def test_bootstrap_comes_before_the_runtime_trial() -> None:
     assert steps.index("bootstrap script") < steps.index("runtime trial")
 
 
+def test_bootstrap_step_creates_no_secret_and_lines_fit() -> None:
+    steps = section("## 8. What the owner does by hand")
+    step_2 = steps[steps.index("2. Run the bootstrap") : steps.index("3. Run the runtime")]
+    assert "the secret" not in step_2
+    assert all(len(line) <= 100 for line in step_2.splitlines())
+
+
+def test_watcher_and_make_init_already_done() -> None:
+    steps = section("## 8. What the owner does by hand")
+    step_5 = steps[steps.index("5. ") : steps.index("6. ")]
+    step_6 = steps[steps.index("6. ") : steps.index("7. ")]
+    assert "2026-11-25" in step_5
+    assert "make init" not in step_6
+    assert "`make verify`" in step_6
+
+
 def test_phase_1_step_4_uses_the_task_loop() -> None:
     phase = section("### Phase 1: containers on the laptop")
     assert "written by hand in four" not in phase
