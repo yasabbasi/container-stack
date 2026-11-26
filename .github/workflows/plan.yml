@@ -1,0 +1,74 @@
+name: plan
+
+on:
+  pull_request:
+    paths:
+      - terraform/**
+      - .github/workflows/plan.yml
+      - .github/workflows/apply.yml
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs on any pull request, so it gets no secret and no way to sign in: validate runs the
+  # provider plugins that the pull request names.
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/google
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.17.2"
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -input=false -backend=false && terraform validate -no-color
+
+  # Terraform written by anyone but the owner is validated, never planned: a plan runs it
+  # with an identity. Google also accepts this sign-in only for a run the owner started.
+  plan:
+    needs: validate
+    if: github.event.pull_request.user.id == github.repository_owner_id
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: terraform/google
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_VAR_github_repository: ${{ github.repository }}
+      # Named here so that GitHub masks them wherever Terraform prints them.
+      MASKED_NUMBER: ${{ secrets.GCP_PROJECT_NUMBER }}
+      MASKED_EMAIL: ${{ secrets.OWNER_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.17.2"
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: terraform-plan@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com
+      - env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -input=false -backend-config="bucket=$TF_STATE_BUCKET"
+      # No lock: this identity can read the state and can't write to its bucket. The summary
+      # holds whole lines only, so a masked value is never cut in two.
+      - run: |
+          set +e
+          terraform plan -input=false -lock=false -no-color 2>&1 | tee plan.txt
+          status=${PIPESTATUS[0]}
+          { echo '```text'; head -n 500 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+        shell: bash
