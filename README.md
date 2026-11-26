@@ -5,7 +5,8 @@ Runs [task-agent](https://github.com/yasabbasi/task-agent),
 [mcp-server](https://github.com/yasabbasi/mcp-server) from containers, on any machine.
 
 Nothing runs yet. The plan is in [docs/plan.md](docs/plan.md); the owner approved it on
-2026-11-24 and the work is under way.
+2026-11-24 and the work is under way. The one-time cloud setup is in
+[docs/bootstrap.md](docs/bootstrap.md).
 
 ## Development
 
