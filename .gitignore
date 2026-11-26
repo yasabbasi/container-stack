@@ -13,3 +13,8 @@ dist/
 .env.*
 !.env.example
 *.pem
+
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
