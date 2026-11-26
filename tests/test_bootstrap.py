@@ -110,7 +110,11 @@ elif args[:2] == ["iam", "service-accounts"] and "add-iam-policy-binding" in arg
         members.append(flag("--member"))
 elif "providers" in args and "list" in args:
     pool = flag("--workload-identity-pool")
-    out = (["github"] if key() in state else []) + config["providers"].get(pool, [])
+    hidden = state.get("hidden/" + pool, 0)
+    if hidden < config["hidden"].get(pool, 0):
+        state["hidden/" + pool] = hidden + 1
+    else:
+        out = (["github"] if key() in state else []) + config["providers"].get(pool, [])
 elif "describe" in args:
     sys.exit(0 if key() in state else 1)
 elif "create" in args or "create-oidc" in args:
@@ -153,6 +157,7 @@ def run(
         "members": {},
         "rows": {},
         "providers": {},
+        "hidden": {},
         "fail": [],
         "flaky": {},
     } | overrides
@@ -439,6 +444,22 @@ def test_extra_provider_is_reported_at_once(tmp_path: Path, pool: str) -> None:
     assert result.returncode == 1
     assert "one provider" in result.stderr
     assert [c for c in calls if c[0] == "sleep"] == []
+
+
+@pytest.mark.parametrize("pool", ["github", "github-production"])
+def test_new_provider_is_waited_for(tmp_path: Path, pool: str) -> None:
+    result, calls = run(tmp_path, hidden={pool: 2})
+    assert result.returncode == 0, result.stderr
+    assert len(find(calls, "providers", "list")) == 4
+    assert len([c for c in calls if c[0] == "sleep"]) == 2
+
+
+def test_provider_that_never_shows_stops_the_run(tmp_path: Path) -> None:
+    result, calls = run(tmp_path, hidden={"github": 99})
+    assert result.returncode == 1
+    assert "no provider yet" in result.stderr
+    assert "run this again" in result.stderr
+    assert bindings(calls) == []
 
 
 def test_keys_are_listed_for_user_managed_only(tmp_path: Path) -> None:
