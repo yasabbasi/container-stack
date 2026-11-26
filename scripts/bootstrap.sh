@@ -4,7 +4,7 @@
 # state bucket, the federation from GitHub, the plan and apply identities, and the budget.
 set -eu
 
-cd "$(dirname "$0")/.."
+CDPATH='' cd -- "$(dirname "$0")/.."
 
 # The environment wins over .env, which is read, never run.
 project=${GCP_PROJECT:-} region=${GCP_REGION:-} budget=${BUDGET:-}
@@ -25,14 +25,27 @@ region=${region:-us-central1} budget=${budget:-75}
     echo "usage: GCP_PROJECT=<project id> [GCP_REGION=us-central1] [BUDGET=75] sh scripts/bootstrap.sh" >&2
     exit 2
 }
-bucket="$project-terraform-state"
-domain="$project.iam.gserviceaccount.com"
 
 step() { printf '\n== %s\n' "$*"; }
 fail() {
     echo "$*" >&2
     exit 1
 }
+
+# name, value, allowed characters.
+setting() {
+    case $2 in
+        '' | *[!"$3"]*)
+            fail "$1 may hold only $4. Values in .env are taken literally:" \
+                "no quotes, and no comment on the line."
+            ;;
+    esac
+}
+setting GCP_PROJECT "$project" abcdefghijklmnopqrstuvwxyz0123456789- "lowercase letters, digits and hyphens"
+setting GCP_REGION "$region" abcdefghijklmnopqrstuvwxyz0123456789- "lowercase letters, digits and hyphens"
+setting BUDGET "$budget" 0123456789 digits
+bucket="$project-terraform-state"
+domain="$project.iam.gserviceaccount.com"
 
 # A new account or pool can take a minute or more to be visible to the next command.
 retry() {
@@ -78,7 +91,7 @@ email=$(gcloud config get-value account 2>/dev/null)
 billing=$(gcloud billing projects describe "$project" --format 'value(billingAccountName)')
 billing=${billing#billingAccounts/}
 [ -n "$billing" ] || fail "The project has no billing account. Nothing on Google Cloud was changed."
-echo "repo $repo, project $project"
+echo "repo $repo"
 
 step "Enabling the APIs"
 gcloud services enable --project "$project" \
@@ -97,10 +110,6 @@ pools() { gcloud iam workload-identity-pools "$@" --project "$project" --locatio
 # A just-enabled API can fail a describe, which would look like "does not exist".
 retry pools list >/dev/null
 
-only_github() {
-    [ "$(pools providers list --workload-identity-pool "$1" --format 'value(name.basename())')" = github ]
-}
-
 # One pool per kind of run, each with one provider named github: pool, mapping, condition.
 federation() {
     pools describe "$1" >/dev/null 2>&1 || pools create "$1" --display-name "GitHub: $1"
@@ -112,7 +121,8 @@ federation() {
     retry pools providers "$verb" github --workload-identity-pool "$1" \
         --issuer-uri "https://token.actions.githubusercontent.com" \
         --attribute-mapping "$2" --attribute-condition "$3"
-    retry only_github "$1" || fail "Pool $1 must have one provider, github, and no other."
+    names=$(retry pools providers list --workload-identity-pool "$1" --format 'value(name.basename())')
+    [ "$names" = github ] || fail "Pool $1 must have one provider, github, and no other."
 }
 
 # Tokens are accepted from this repo and this owner only, matched by ids that can't be reused.
@@ -140,11 +150,13 @@ create_account() {
 check_account() {
     who="$1@$domain"
     keys=$(retry accounts keys list --iam-account "$who" --managed-by user --format 'value(name)')
-    [ -z "$keys" ] || fail "$who has user-managed keys. Delete them, then run this again."
+    [ -z "$keys" ] || fail "$1 has user-managed keys. Delete them, then run this again."
     policy=$(retry accounts get-iam-policy "$who" --flatten 'bindings[].members' \
         --format 'value(bindings.role,bindings.members)')
+    # With no bindings, gcloud prints one empty row: a lone tab.
+    case $policy in *[![:space:]]*) ;; *) policy= ;; esac
     [ -z "$policy" ] || [ "$policy" = "$(printf 'roles/iam.workloadIdentityUser\t%s' "$2")" ] ||
-        fail "$who has an unexpected policy: $policy"
+        fail "$1 has an unexpected policy: $policy"
 }
 
 # name, member, bucket role, then project roles.

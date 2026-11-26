@@ -22,6 +22,7 @@
 - A project with billing enabled.
 - The settings in `.env.example`, in the environment or in `.env` beside the `Makefile`.
   Only `GCP_PROJECT` is required. `BUDGET` is in the billing account's currency.
+  Values in `.env` are taken literally: no quotes, and no comment on the line.
 
 ## How to run it
 

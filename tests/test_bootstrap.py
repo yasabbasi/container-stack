@@ -101,12 +101,16 @@ elif "keys" in args:
 elif "get-iam-policy" in args:
     members = state.get("member/" + args[3], []) + config["members"].get(args[3], [])
     out = ["roles/iam.workloadIdentityUser\\t" + member for member in members]
+    out += config["rows"].get(args[3], [])
+    # With no bindings, the real CLI prints one empty row: a lone tab.
+    out = out or ["\\t"]
 elif args[:2] == ["iam", "service-accounts"] and "add-iam-policy-binding" in args:
     members = state.setdefault("member/" + args[3], [])
     if flag("--member") not in members:
         members.append(flag("--member"))
 elif "providers" in args and "list" in args:
-    out = (["github"] if key() in state else []) + config["providers"]
+    pool = flag("--workload-identity-pool")
+    out = (["github"] if key() in state else []) + config["providers"].get(pool, [])
 elif "describe" in args:
     sys.exit(0 if key() in state else 1)
 elif "create" in args or "create-oidc" in args:
@@ -122,6 +126,8 @@ def run(
     project: str | None = "demo",
     dotenv: str | None = None,
     env_extra: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    makefile: bool = True,
     **overrides: Any,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     """Run a copy of the script, away from the repo's .env, with stub gcloud, gh and sleep."""
@@ -129,7 +135,8 @@ def run(
     (repo / "scripts").mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(exist_ok=True)
     shutil.copy(ROOT / "scripts" / "bootstrap.sh", repo / "scripts")
-    (repo / "Makefile").write_text("")
+    if makefile:
+        (repo / "Makefile").write_text("")
     if dotenv is not None:
         (repo / ".env").write_text(dotenv)
     for tool in ("gcloud", "gh", "sleep"):
@@ -144,7 +151,8 @@ def run(
         "billing": "billingAccounts/stub-billing",
         "keys": {},
         "members": {},
-        "providers": [],
+        "rows": {},
+        "providers": {},
         "fail": [],
         "flaky": {},
     } | overrides
@@ -157,12 +165,13 @@ def run(
         "STUB_CONFIG": str(tmp_path / "config.json"),
         "STUB_STATE": str(tmp_path / "state.json"),
         "STUB_LOG": str(log),
-    } | (env_extra or {})
+    }
     if project is not None:
         env["GCP_PROJECT"] = project
+    env |= env_extra or {}
     result = subprocess.run(
-        ["sh", "scripts/bootstrap.sh"],
-        cwd=repo,
+        ["sh", str(repo / "scripts" / "bootstrap.sh") if cwd else "scripts/bootstrap.sh"],
+        cwd=cwd or repo,
         env=env,
         capture_output=True,
         text=True,
@@ -351,19 +360,37 @@ def test_github_problems_stop_before_google(
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    ("overrides", "message"),
     [
-        {"gate": "false "},
-        {"gate": f"false {OWNER_ID},999"},
-        {"gate": f"true {OWNER_ID}"},
-        {"branches": ["main", "dev"]},
+        ({"gate": "false "}, "reviewer"),
+        ({"gate": f"false {OWNER_ID},999"}, "reviewer"),
+        ({"gate": f"true {OWNER_ID}"}, "reviewer"),
+        ({"gate": ""}, "reviewer"),
+        ({"gate": "null"}, "reviewer"),
+        ({"branches": ["main", "dev"]}, "reviewer"),
+        ({"fail": ["production --jq"]}, ""),
     ],
 )
-def test_weak_environment_stops_before_google(tmp_path: Path, overrides: dict[str, Any]) -> None:
+def test_weak_environment_stops_before_google(
+    tmp_path: Path, overrides: dict[str, Any], message: str
+) -> None:
     result, calls = run(tmp_path, **overrides)
     assert result.returncode == 1
-    assert "reviewer" in result.stderr
-    assert [c for c in calls if c[:2] == ["gcloud", "iam"]] == []
+    assert message in result.stderr
+    assert [c for c in calls if c[0] == "gcloud"] == []
+
+
+def test_environment_is_read_back_exactly(tmp_path: Path) -> None:
+    _, calls = run(tmp_path)
+    reads = [c for c in calls if c[:3] == ["gh", "api", "repos/owner/repo/environments/production"]]
+    assert [c[3:] for c in reads] == [
+        [
+            "--jq",
+            '"\\(.can_admins_bypass) \\([.protection_rules[]\n'
+            '    | select(.type == "required_reviewers") | .reviewers[].reviewer.id'
+            ' | tostring] | join(","))"',
+        ]
+    ]
 
 
 @pytest.mark.parametrize(
@@ -385,9 +412,16 @@ def test_google_problems_stop_before_changes(
         {"members": {PLAN: ["principal://example/other"]}},
         {"members": {APPLY: ["principal://example/other"]}},
         {"members": {PLAN: [PLAN_MEMBER + "9"]}},
+        {"members": {APPLY: [PLAN_MEMBER]}},
+        {"rows": {PLAN: ["roles/iam.serviceAccountTokenCreator\tprincipal://example/other"]}},
+        {"rows": {APPLY: ["roles/iam.serviceAccountTokenCreator\tprincipal://example/other"]}},
         {"fail": ["get-iam-policy"]},
+        {"keys": {PLAN: ["key-1"]}},
         {"keys": {APPLY: ["key-1"]}},
-        {"providers": ["other"]},
+        {"fail": ["keys list"]},
+        {"providers": {"github": ["other"]}},
+        {"providers": {"github-production": ["other"]}},
+        {"fail": ["providers list"]},
     ],
 )
 def test_unexpected_access_stops_before_any_binding(
@@ -397,3 +431,81 @@ def test_unexpected_access_stops_before_any_binding(
     assert result.returncode != 0
     assert bindings(calls) == []
     assert find(calls, "secret") == []
+
+
+@pytest.mark.parametrize("pool", ["github", "github-production"])
+def test_extra_provider_is_reported_at_once(tmp_path: Path, pool: str) -> None:
+    result, calls = run(tmp_path, providers={pool: ["other"]})
+    assert result.returncode == 1
+    assert "one provider" in result.stderr
+    assert [c for c in calls if c[0] == "sleep"] == []
+
+
+def test_keys_are_listed_for_user_managed_only(tmp_path: Path) -> None:
+    _, calls = run(tmp_path)
+    keys = find(calls, "keys", "list")
+    assert [(flag(c, "--iam-account"), flag(c, "--managed-by")) for c in keys] == [
+        (PLAN, "user"),
+        (APPLY, "user"),
+    ]
+
+
+def test_output_hides_the_project_and_the_account(tmp_path: Path) -> None:
+    result, _ = run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "repo owner/repo" in result.stdout
+    assert "demo" not in result.stdout + result.stderr
+    assert "owner-account" not in result.stdout + result.stderr
+
+
+def test_runs_from_another_directory(tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    result, calls = run(tmp_path, project=None, dotenv="GCP_PROJECT=demo\n", cwd=elsewhere)
+    assert result.returncode == 0, result.stderr
+    assert flag(calls[-1], "--filter-projects") == "projects/demo"
+
+
+def test_cdpath_cannot_move_the_script(tmp_path: Path) -> None:
+    decoy = tmp_path / "decoy"
+    (decoy / "scripts").mkdir(parents=True)
+    (decoy / "Makefile").write_text("")
+    (decoy / ".env").write_text("GCP_PROJECT=decoy\n")
+    result, calls = run(
+        tmp_path, project=None, dotenv="GCP_PROJECT=demo\n", env_extra={"CDPATH": str(decoy)}
+    )
+    assert result.returncode == 0, result.stderr
+    assert flag(calls[-1], "--filter-projects") == "projects/demo"
+
+
+def test_dotenv_without_a_makefile_is_ignored(tmp_path: Path) -> None:
+    result, calls = run(tmp_path, project=None, dotenv="GCP_PROJECT=demo\n", makefile=False)
+    assert result.returncode == 2
+    assert calls == []
+
+
+def test_dotenv_value_with_equals_is_read_whole(tmp_path: Path) -> None:
+    result, calls = run(tmp_path, dotenv="BUDGET=2=0\n")
+    assert result.returncode == 1
+    assert "BUDGET" in result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("dotenv", "env_extra", "name"),
+    [
+        (None, {"GCP_PROJECT": "Demo"}, "GCP_PROJECT"),
+        (None, {"GCP_REGION": "us central1"}, "GCP_REGION"),
+        (None, {"BUDGET": "75USD"}, "BUDGET"),
+        ('BUDGET="75"\n', None, "BUDGET"),
+        ("GCP_REGION=europe-west1 # mine\n", None, "GCP_REGION"),
+    ],
+)
+def test_bad_settings_stop_before_any_call(
+    tmp_path: Path, dotenv: str | None, env_extra: dict[str, str] | None, name: str
+) -> None:
+    result, calls = run(tmp_path, dotenv=dotenv, env_extra=env_extra)
+    assert result.returncode == 1
+    assert name in result.stderr
+    assert "literally" in result.stderr
+    assert calls == []
