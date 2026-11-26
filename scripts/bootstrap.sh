@@ -110,6 +110,12 @@ pools() { gcloud iam workload-identity-pools "$@" --project "$project" --locatio
 # A just-enabled API can fail a describe, which would look like "does not exist".
 retry pools list >/dev/null
 
+# A just-created provider can be missing from the list for a moment.
+listed() {
+    names=$(pools providers list --workload-identity-pool "$1" --format 'value(name.basename())') &&
+        [ -n "$names" ]
+}
+
 # One pool per kind of run, each with one provider named github: pool, mapping, condition.
 federation() {
     pools describe "$1" >/dev/null 2>&1 || pools create "$1" --display-name "GitHub: $1"
@@ -121,7 +127,7 @@ federation() {
     retry pools providers "$verb" github --workload-identity-pool "$1" \
         --issuer-uri "https://token.actions.githubusercontent.com" \
         --attribute-mapping "$2" --attribute-condition "$3"
-    names=$(retry pools providers list --workload-identity-pool "$1" --format 'value(name.basename())')
+    retry listed "$1" || fail "Pool $1 has no provider yet. Wait a minute, then run this again."
     [ "$names" = github ] || fail "Pool $1 must have one provider, github, and no other."
 }
 
